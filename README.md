@@ -4,7 +4,6 @@ This Go application cleans up incomplete or abandoned Multipart uploads from the
 
 https://github.com/docker/distribution/issues/1948
 
-
 ## License and Software Information
  
 © adidas AG
@@ -34,3 +33,9 @@ Please note that this checks the *startedat* file inside the upload path to dete
 If the S3 API is giving inconsistent responses (empty upload list, different list on every query), the script might need to be executed multiple times until the number of existing uploads is reduced.
 
 It is recommended to run this as a scheduled job to perform a daily cleanup of incomplete uploads.
+
+Releases
+--------
+
+* 1.0.0 - First version
+* 1.1.0 - Also remove _upload/ folders 

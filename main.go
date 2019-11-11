@@ -34,51 +34,135 @@ func main() {
 		Prefix:    aws.String("docker/registry/v2/repositories/"),
 		Delimiter: aws.String("/"),
 	})
+
 	if err != nil {
 		panic(err)
+	}
+
+	if *objs.IsTruncated {
+		panic("Output is truncated. TO-DO: implement pagination")
 	}
 
 	for i, cp := range objs.CommonPrefixes {
 		fmt.Printf("Prefix %d: %s\n", i, *cp.Prefix)
 
-		resp, err := s.ListMultipartUploads(&s3.ListMultipartUploadsInput{
-			Bucket:     aws.String(bucket),
-			Prefix:     aws.String(*cp.Prefix),
-			MaxUploads: aws.Int64(1000),
+		totalRemoved += cleanMPUs(s, bucket, *cp.Prefix)
+		fmt.Printf("  Total MPUs removed: %d\n", totalRemoved)
+	}
+
+	fmt.Println()
+	fmt.Println("Removing upload folders:")
+	cleanUploadFolders(s, bucket, *objs.Prefix)
+
+}
+
+func cleanMPUs(s *s3.S3, bucket, prefix string) (totalRemoved int) {
+	totalRemoved = 0
+
+	resp, err := s.ListMultipartUploads(&s3.ListMultipartUploadsInput{
+		Bucket:     aws.String(bucket),
+		Prefix:     aws.String(prefix),
+		MaxUploads: aws.Int64(1000),
+	})
+
+	if err != nil {
+		panic(err)
+	}
+
+	if *resp.IsTruncated {
+		panic("Output is truncated. TO-DO: implement pagination")
+	}
+
+	fmt.Printf(" # of MPUs found for prefix: %d\n", len(resp.Uploads))
+
+	for i, multi := range resp.Uploads {
+		fmt.Printf("  Upload %d: %s\n", i, *multi.Key)
+
+		hoursSince := int(time.Since(*multi.Initiated).Hours())
+
+		fmt.Printf("  Started %d hours ago\n", hoursSince)
+
+		if hoursSince > cleanupHours {
+			_, err = s.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(bucket),
+				Key:      multi.Key,
+				UploadId: multi.UploadId,
+			})
+
+			if err != nil {
+				fmt.Printf(" ERROR: %s\n", err)
+			} else {
+				fmt.Println("   Removed!")
+				totalRemoved++
+			}
+		}
+	}
+
+	return
+}
+
+func cleanUploadFolders(s *s3.S3, bucket, prefix string) {
+	shouldContinue := true
+	var continuationToken *string
+	for shouldContinue {
+
+		objs, err := s.ListObjectsV2(&s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			MaxKeys:           aws.Int64(100),
+			ContinuationToken: continuationToken,
 		})
+
 		if err != nil {
 			panic(err)
 		}
 
-		fmt.Printf(" # of uploads found for prefix: %d\n", len(resp.Uploads))
-
-		for i, multi := range resp.Uploads {
-			fmt.Printf("  Upload %d: %s\n", i, *multi.Key)
-
-			hoursSince, err := hoursSinceUploadStarted(s, bucket, *multi.Key)
-			if err != nil {
-				fmt.Printf(" ERROR: %s\n", err)
-				continue
-			}
-
-			fmt.Printf("  Started %d hours ago\n", hoursSince)
-
-			if hoursSince > cleanupHours {
-				_, err = s.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
-					Bucket:   aws.String(bucket),
-					Key:      multi.Key,
-					UploadId: multi.UploadId,
-				})
+		for _, o := range objs.Contents {
+			if strings.Contains(*o.Key, "/_uploads/") && strings.HasSuffix(*o.Key, "/startedat") {
+				hoursSince, err := hoursSinceUploadStarted(s, bucket, *o.Key)
 				if err != nil {
-					fmt.Printf(" ERROR: %s", err)
-				} else {
-					totalRemoved++
-					fmt.Printf("  Removed, for a total of %d uploads\n", totalRemoved)
+					fmt.Printf(" ERROR: %s\n", err)
+					continue
 				}
 
+				if hoursSince > cleanupHours {
+					fmt.Printf("  Removing folder %s (%d hours)\n", *o.Key, hoursSince)
+					removeUploadFolder(s, bucket, *o.Key)
+				} else {
+					fmt.Printf("  Skipping folder %s (%d hours)\n", *o.Key, hoursSince)
+				}
 			}
-
 		}
+
+		continuationToken = objs.NextContinuationToken
+		shouldContinue = *objs.IsTruncated
+	}
+}
+
+func removeUploadFolder(s *s3.S3, bucket, prefix string) {
+	keyParts := strings.Split(prefix, "/")
+	uploadsFolder := strings.Join(keyParts[0:len(keyParts)-1], "/")
+
+	objs, err := s.ListObjectsV2(&s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(uploadsFolder),
+	})
+
+	if err != nil {
+		panic(err)
+	}
+
+	for _, o := range objs.Contents {
+		_, err := s.DeleteObject(&s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    o.Key,
+		})
+
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("    Removing %s\n", *o.Key)
 	}
 
 }
@@ -117,10 +201,9 @@ func getS3Client(endPoint, accessKey, secretAccessKey string) *s3.S3 {
 }
 
 func hoursSinceUploadStarted(s *s3.S3, bucket, key string) (int, error) {
-	startedat := strings.TrimRight(key, "data") + "startedat"
 	obj, err := s.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(bucket),
-		Key:    aws.String(startedat),
+		Key:    aws.String(key),
 	})
 
 	if err != nil {
